@@ -1,0 +1,12 @@
+
+streamlit>=1.49.0
+google-genai
+python-dotenv
+pypdf
+Pillow
+langchain-core
+langchain-community
+langchain-google-genai
+faiss-cpu
+groq
+langchain-text-splitters

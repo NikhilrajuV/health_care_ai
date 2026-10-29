@@ -1,0 +1,773 @@
+
+import os
+import hashlib
+import streamlit as st
+from dotenv import load_dotenv
+from groq import Groq
+
+from src.rag import retrieve_medical_context
+from src.image_analysis import analyze_image
+
+
+# =========================================================
+# 1. CONFIGURATION
+# =========================================================
+
+load_dotenv(override=True)
+
+st.set_page_config(
+    page_title="HealthCare AI",
+    page_icon="🩺",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "openai/gpt-oss-120b",
+).strip()
+
+# Initial tuning value; not a guarantee of medical relevance.
+RAG_SCORE_THRESHOLD = 0.55
+RAG_TOP_K = 4
+MAX_IMAGE_SIZE = 10 * 1024 * 1024
+
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+
+# =========================================================
+# 2. SESSION STATE
+# =========================================================
+
+defaults = {
+    "messages": [],
+    "image_context": None,
+    "image_filename": None,
+    "analyzed_image_id": None,
+    "last_rag_warning": None,
+}
+
+for key, default_value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = default_value
+
+
+# =========================================================
+# 3. CUSTOM UI
+# =========================================================
+
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: linear-gradient(
+            135deg, #f4f9ff 0%, #edf8f5 100%
+        );
+        color: #172b4d !important;
+    }
+
+    .block-container {
+        max-width: 1050px;
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+    }
+
+    .stMarkdown,
+    .stMarkdown p,
+    .stMarkdown li,
+    .stMarkdown strong,
+    .stMarkdown em,
+    [data-testid="stChatMessage"] p,
+    [data-testid="stChatMessage"] li,
+    [data-testid="stCaptionContainer"] {
+        color: #243447 !important;
+    }
+
+    h1, h2, h3, h4, h5, h6 {
+        color: #123b52 !important;
+    }
+
+    .hero {
+        background: linear-gradient(120deg, #0f766e, #2563eb);
+        padding: 28px;
+        border-radius: 20px;
+        margin-bottom: 20px;
+        color: white !important;
+    }
+
+    .hero h1 {
+        color: white !important;
+    }
+
+    .hero p {
+        color: #eaf7ff !important;
+    }
+
+    .notice {
+        background: #fff7e6;
+        border-left: 5px solid #e5a000;
+        padding: 14px;
+        border-radius: 8px;
+        margin: 15px 0 22px;
+        color: #664d03 !important;
+    }
+
+    .notice strong {
+        color: #664d03 !important;
+    }
+
+    [data-testid="stSidebar"] {
+        background-color: #eaf3f8 !important;
+    }
+
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3 {
+        color: #19384d !important;
+    }
+
+    [data-testid="stChatMessage"] {
+        background: white !important;
+        border: 1px solid #dce8ef;
+        border-radius: 14px;
+        padding: 14px;
+    }
+
+    [data-testid="stChatInput"] textarea {
+        color: #172b4d !important;
+        -webkit-text-fill-color: #172b4d !important;
+        caret-color: #0f766e !important;
+    }
+
+    [data-testid="stChatInput"] textarea::placeholder {
+        color: #64748b !important;
+        -webkit-text-fill-color: #64748b !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# =========================================================
+# 4. HEADER
+# =========================================================
+
+st.markdown(
+    """
+    <div class="hero">
+        <h1>🩺 HealthCare AI</h1>
+        <p>
+            Your AI assistant for general healthcare information.
+            Ask questions, explore medical references, and describe images.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="notice">
+        <strong>Medical safety notice:</strong>
+        This AI provides general information, not a confirmed diagnosis.
+        It does not replace a qualified healthcare professional.
+        Seek urgent medical care for emergencies.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# =========================================================
+# 5. HELPER: CLEAR CONVERSATION
+# =========================================================
+
+def clear_conversation():
+    """Clear chat history and the current image context."""
+    st.session_state.messages = []
+    st.session_state.image_context = None
+    st.session_state.image_filename = None
+    st.session_state.analyzed_image_id = None
+    st.session_state.last_rag_warning = None
+
+
+# =========================================================
+# 6. IMAGE ANALYSIS
+# =========================================================
+
+st.markdown("## 🖼️ Image Analysis")
+
+st.write(
+    "Upload an image to generate a description. "
+    "You can ask follow-up questions in the chat."
+)
+st.caption("Accepted formats: JPG, JPEG, PNG, WEBP • Maximum image size: 10 MB")
+
+uploaded_image = st.file_uploader(
+    "Choose an image",
+    type=["jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=False,
+    key="general_image_uploader",
+)
+
+if uploaded_image is not None:
+    image_bytes = uploaded_image.getvalue()
+
+    image_id = hashlib.sha256(image_bytes).hexdigest()
+
+    st.image(
+        image_bytes,
+        caption=f"Uploaded image: {uploaded_image.name}",
+        use_container_width=True,
+    )
+
+    if len(image_bytes) > MAX_IMAGE_SIZE:
+        st.error("Please upload an image smaller than 10 MB.")
+
+    else:
+        if st.button(
+            "🔍 Analyze Image",
+            key="analyze_general_image",
+            use_container_width=True,
+        ):
+            try:
+                with st.spinner("Analyzing image..."):
+                    description = analyze_image(
+                        image_bytes=image_bytes,
+                        mime_type=uploaded_image.type,
+                    )
+
+                if not description or not str(description).strip():
+                    raise ValueError(
+                        "The vision model returned an empty description."
+                    )
+
+                description = str(description).strip()
+
+                st.session_state.image_context = description
+                st.session_state.image_filename = uploaded_image.name
+                st.session_state.analyzed_image_id = image_id
+
+                st.session_state.messages.append({
+                    "role": "user",
+                    "content": (
+                        f"📷 Uploaded image: {uploaded_image.name}"
+                    ),
+                })
+
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": (
+                        "### 📝 Image Description\n\n"
+                        f"{description}\n\n"
+                        f"*Image: {uploaded_image.name}*\n\n"
+                        "You can ask follow-up questions about this "
+                        "description in the chat below."
+                    ),
+                    "sources": [],
+                })
+
+                st.success("Image analysis completed.")
+                st.rerun()
+
+            except Exception as exc:
+                st.error("Image analysis failed.")
+                st.code(f"{type(exc).__name__}: {exc}")
+                st.caption(
+                    "Check your vision model configuration, API access, "
+                    "image format, internet connection, and API limits."
+                )
+
+if st.session_state.image_context:
+    with st.expander("Current image context", expanded=False):
+        st.caption(
+            f"Image: {st.session_state.image_filename}"
+        )
+        st.write(st.session_state.image_context)
+
+        if st.button(
+            "Clear image context",
+            key="clear_image_context",
+        ):
+            st.session_state.image_context = None
+            st.session_state.image_filename = None
+            st.session_state.analyzed_image_id = None
+            st.rerun()
+
+st.divider()
+
+
+# =========================================================
+# 7. SIDEBAR
+# =========================================================
+
+with st.sidebar:
+    st.markdown("## 🩺 HealthCare AI")
+    st.caption("Preliminary healthcare information")
+
+    st.divider()
+    st.markdown("### 💬 Conversation")
+
+    if st.button(
+        "➕ New / Clear Chat",
+        use_container_width=True,
+    ):
+        clear_conversation()
+        st.rerun()
+
+    st.divider()
+    st.markdown("### ⚙️ Configuration")
+
+    st.write(f"**Chat model:** `{GROQ_MODEL}`")
+
+    if client:
+        st.success("Groq API configured")
+    else:
+        st.error("GROQ_API_KEY missing in .env")
+
+    st.caption(
+        "Never share your API key. Avoid entering personal "
+        "identifiers or unnecessary sensitive information."
+    )
+
+    st.divider()
+    st.markdown("### 🚀 Project progress")
+
+    st.markdown(
+        """
+        - ✅ Streamlit website
+        - ✅ Groq chatbot
+        - ✅ Medical PDF RAG
+        - ✅ FAISS retrieval
+        - ✅ Vision AI descriptions
+        - ✅ Image context in chat
+        - ✅ Source filtering
+        """
+    )
+
+
+# =========================================================
+# 8. RETRIEVE AND FILTER MEDICAL CONTEXT
+# =========================================================
+
+def get_relevant_medical_context(question):
+    """
+    Retrieve passages and apply one consistent relevance threshold.
+
+    The filtered passages are used both for answer generation
+    and for displaying source references.
+    """
+    if not question or not question.strip():
+        return [], None
+
+    try:
+        retrieved = retrieve_medical_context(
+            question.strip(),
+            k=RAG_TOP_K,
+        )
+
+        if not retrieved:
+            return [], None
+
+        relevant = []
+        seen = set()
+
+        for item in retrieved:
+            text = str(item.get("text", "")).strip()
+            source = str(item.get("source", "")).strip()
+
+            if not text or not source:
+                continue
+
+            # Current rag.py returns relevance_score.
+            # Do not treat missing scores as relevant.
+            score = item.get("relevance_score")
+
+            if score is None:
+                continue
+
+            try:
+                score = float(score)
+            except (TypeError, ValueError):
+                continue
+
+            if score < RAG_SCORE_THRESHOLD:
+                continue
+
+            try:
+                page = int(item.get("page", 0))
+            except (TypeError, ValueError):
+                continue
+
+            if page < 1:
+                continue
+
+            key = (source, page, text)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            relevant.append({
+                "text": text,
+                "source": source,
+                "page": page,
+                "relevance_score": score,
+            })
+
+        return relevant, None
+
+    except Exception as exc:
+        warning = (
+            "Medical document retrieval failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return [], warning
+
+
+# =========================================================
+# 9. BUILD SOURCES FROM FILTERED PASSAGES ONLY
+# =========================================================
+
+def build_source_list(medical_context):
+    """Build unique, valid source references."""
+    source_pairs = set()
+
+    for item in medical_context:
+        source = str(item.get("source", "")).strip()
+        text = str(item.get("text", "")).strip()
+
+        if not source or not text:
+            continue
+
+        try:
+            page = int(item.get("page", 0))
+        except (TypeError, ValueError):
+            continue
+
+        if page < 1:
+            continue
+
+        source_pairs.add((source, page))
+
+    return [
+        {"source": source, "page": page}
+        for source, page in sorted(source_pairs)
+    ]
+
+
+# =========================================================
+# 10. GROQ RESPONSE
+# =========================================================
+
+def generate_response(
+    question,
+    history_text,
+    medical_context,
+    image_context,
+    image_filename,
+):
+    """Generate a general-information response grounded in context."""
+
+    if client is None:
+        raise RuntimeError(
+            "GROQ_API_KEY is missing. Check your .env file."
+        )
+
+    if medical_context:
+        medical_text = "\n\n".join(
+            (
+                f"Source: {item['source']}, page {item['page']}\n"
+                f"Relevance score: {item['relevance_score']:.3f}\n"
+                f"Passage: {item['text']}"
+            )
+            for item in medical_context
+        )
+    else:
+        medical_text = (
+            "No sufficiently relevant medical document passages "
+            "were retrieved for this question."
+        )
+
+    if image_context:
+        image_text = (
+            f"Image filename: {image_filename or 'Unknown'}\n"
+            f"Previously generated image description:\n{image_context}"
+        )
+    else:
+        image_text = "No image description is currently available."
+
+    system_message = """
+You are HealthCare AI, an assistant providing cautious,
+general healthcare information.
+
+MEDICAL SAFETY:
+1. Never present an AI response as a confirmed diagnosis.
+2. Do not claim to diagnose a condition from a general image description.
+3. Recommend professional assessment when appropriate.
+4. For possible emergencies, advise immediate medical care.
+   In India, call 112 for emergencies when appropriate.
+5. Never advise delaying urgent medical care.
+6. Do not provide unsupported certainty about causes or treatments.
+
+SOURCE-GROUNDING RULES:
+1. Use the supplied passages as the only evidence for claims about the uploaded documents.
+2. Cite a filename and page immediately after each document-supported claim.
+3. Only cite a page if its supplied passage directly supports that claim.
+4. Never invent citations, filenames, page numbers, or evidence.
+5. If no relevant passages were retrieved, say:
+   "I could not find relevant information in the uploaded medical documents."
+6. When no relevant passages were retrieved, do not add general medical
+   treatment advice unless the user explicitly asks for general information.
+7. If passages only partially answer the question, explain what is missing.
+8. Do not present general knowledge as if it came from an uploaded PDF.
+9. Do not use HTML tags such as <br> in the answer.
+10. Prefer headings and short bullet lists; avoid Markdown tables, especially
+    when presenting medical recommendations.
+11. Cite only the minimum set of passages that directly support the answer.
+
+IMAGE CONTEXT:
+1. Use the supplied image description for relevant follow-up questions.
+2. The description may contain errors or omissions.
+3. The image description is not proof of identity, health status,
+   or a medical diagnosis.
+4. If no image description is available, do not claim to have analyzed
+   an image.
+
+CONVERSATION:
+Use conversation history to understand follow-up questions.
+Answer clearly and avoid unnecessary repetition.
+"""
+
+    user_message = f"""
+PREVIOUS CONVERSATION:
+{history_text or "No previous conversation."}
+
+CURRENT IMAGE CONTEXT:
+{image_text}
+
+RETRIEVED MEDICAL DOCUMENT PASSAGES:
+{medical_text}
+
+CURRENT USER QUESTION:
+{question}
+
+Please answer the current question.
+
+If the retrieved passages are relevant, answer only what they support
+and cite the exact filename and page number next to each supported claim.
+
+If the retrieved passages are absent or irrelevant, state that the uploaded
+documents do not provide relevant information. Do not add treatment guidance
+or a long general-information section unless the user explicitly asks for
+general medical information.
+
+Use plain Markdown headings and bullets. Do not output HTML tags or raw
+escaped line-break strings. Do not invent source references.
+"""
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": system_message,
+            },
+            {
+                "role": "user",
+                "content": user_message,
+            },
+        ],
+        temperature=0.2,
+        max_completion_tokens=1400,
+    )
+
+    answer = response.choices[0].message.content
+
+    if not answer or not answer.strip():
+        raise RuntimeError("Groq returned an empty response.")
+
+    return answer.strip()
+
+
+# =========================================================
+# 11. CHAT HISTORY DISPLAY
+# =========================================================
+
+st.markdown("## 💬 HealthCare Chat")
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+        # Display only sources stored with this response.
+        saved_sources = message.get("sources", [])
+
+        if message["role"] == "assistant" and saved_sources:
+            with st.expander("📚 Retrieved document passages"):
+                for source in saved_sources:
+                    name = str(source.get("source", "")).strip()
+
+                    try:
+                        page = int(source.get("page", 0))
+                    except (TypeError, ValueError):
+                        continue
+
+                    if name and page > 0:
+                        st.markdown(
+                            f"- **{name} — page {page}**"
+                        )
+
+
+# =========================================================
+# 12. CHAT INPUT
+# =========================================================
+
+question = st.chat_input(
+    "Ask a health question or follow up about your image..."
+)
+
+if question:
+    # Store the user question.
+    st.session_state.messages.append({
+        "role": "user",
+        "content": question,
+    })
+
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    if client is None:
+        answer = (
+            "Groq is not configured. Check GROQ_API_KEY in your .env file."
+        )
+
+        with st.chat_message("assistant"):
+            st.error(answer)
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "sources": [],
+        })
+
+    else:
+        # Exclude the current question from prior history.
+        previous_messages = st.session_state.messages[:-1][-10:]
+
+        history_text = "\n\n".join(
+            (
+                "User: "
+                if item["role"] == "user"
+                else "Assistant: "
+            )
+            + item["content"]
+            for item in previous_messages
+        )
+
+        medical_context, rag_warning = get_relevant_medical_context(
+            question
+        )
+
+        # This is the single source of truth for both the model
+        # and the source expander.
+        sources = build_source_list(medical_context)
+
+        if rag_warning:
+            st.session_state.last_rag_warning = rag_warning
+        else:
+            st.session_state.last_rag_warning = None
+
+        with st.chat_message("assistant"):
+            if rag_warning:
+                st.warning(
+                    "Medical document search is unavailable. "
+                    "The answer may not be supported by your PDFs."
+                )
+
+            try:
+                with st.spinner("🩺 Preparing your response..."):
+                    answer = generate_response(
+                        question=question,
+                        history_text=history_text,
+                        medical_context=medical_context,
+                        image_context=st.session_state.image_context,
+                        image_filename=st.session_state.image_filename,
+                    )
+
+                st.markdown(answer)
+
+                if sources:
+                    with st.expander("📚 Retrieved document passages"):
+                        st.caption(
+                            "These are the passages retrieved for this question. "
+                            "The answer should cite only pages that directly support its claims."
+                        )
+                        for source in sources:
+                            st.markdown(
+                                f"- **{source['source']} — "
+                                f"page {source['page']}**"
+                            )
+                else:
+                    st.caption(
+                        "No sufficiently relevant passages were retrieved "
+                        "from the uploaded medical documents."
+                    )
+
+                if rag_warning:
+                    st.caption(
+                        "Document retrieval failed for this response. "
+                        "Do not treat it as verified against your PDFs."
+                    )
+
+            except Exception as exc:
+                answer = (
+                    "I could not generate a response because the AI "
+                    "service returned an error. Please try again later. "
+                    "Do not rely on this service for urgent medical concerns."
+                )
+
+                st.error("Groq API request failed.")
+                st.code(f"{type(exc).__name__}: {exc}")
+
+                error_text = str(exc).upper()
+
+                if "401" in error_text or "INVALID API KEY" in error_text:
+                    st.warning("Check your Groq API key.")
+                elif "429" in error_text:
+                    st.warning(
+                        "The Groq rate limit or quota may have been reached."
+                    )
+                elif "404" in error_text or "MODEL_NOT_FOUND" in error_text:
+                    st.warning(
+                        "Check whether your configured chat model "
+                        "is available to your account."
+                    )
+                elif "TIMEOUT" in error_text or "CONNECTION" in error_text:
+                    st.warning("Check your internet connection.")
+
+                sources = []
+
+        # Save only the sources actually passed to the model.
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+        })
+
+
+# =========================================================
+# 13. FOOTER
+# =========================================================
+
+st.divider()
+
+st.caption(
+    "HealthCare AI | Educational prototype | "
+    "Not a substitute for professional medical care"
+)
